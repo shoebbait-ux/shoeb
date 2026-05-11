@@ -1,0 +1,5 @@
+easyocr
+opencv-python
+ffmpeg-python
+tqdm
+numpy
