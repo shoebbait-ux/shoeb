@@ -11,6 +11,50 @@ Automatically detect sensitive text in video recordings and generate an After Ef
 
 ---
 
+## Mac-optimized usage
+
+### Recommended command for Mac (Intel or Apple Silicon)
+```bash
+python detect_and_export.py \
+  --input recording.mp4 \
+  --strings sensitive_strings.txt \
+  --skip-frames 3 \
+  --ocr-scale 0.5 \
+  --scene-change \
+  --workers 4
+```
+
+### Apple Silicon (M1/M2/M3) - enable MPS
+```bash
+python detect_and_export.py \
+  --input recording.mp4 \
+  --strings sensitive_strings.txt \
+  --skip-frames 3 \
+  --ocr-scale 0.5 \
+  --mps \
+  --workers 4
+```
+
+### Resume an interrupted run
+```bash
+python detect_and_export.py \
+  --input recording.mp4 \
+  --strings sensitive_strings.txt \
+  --resume
+```
+
+### Resource guide for Mac
+
+| Mac spec | Recommended flags | Expected time (12-min 1080p) |
+|----------|-------------------|------------------------------|
+| M1/M2/M3 (8-core) | `--workers 4 --skip-frames 3 --mps` | ~15-25 min |
+| Intel Mac (4-core) | `--workers 2 --skip-frames 4 --scene-change` | ~30-45 min |
+| Any Mac (low RAM <8GB) | `--workers 1 --skip-frames 6 --ocr-scale 0.4` | ~20-30 min |
+
+> Terminal screen recordings change slowly - `--scene-change` can skip 60-80% of frames with zero quality loss.
+
+---
+
 ## Prerequisites
 
 - **Python 3.9+**
@@ -58,7 +102,12 @@ This writes `detections.json` with all matched text tracks.
 | `--strings` | *(required)* | Path to sensitive strings file |
 | `--output` | `detections.json` | Where to write results |
 | `--skip-frames` | `2` | Process every Nth frame (higher = faster, may miss brief text) |
-| `--gpu` | off | Enable EasyOCR GPU acceleration |
+| `--gpu` | off | Enable EasyOCR GPU acceleration (CUDA only) |
+| `--ocr-scale` | `0.5` | Downscale factor for OCR input (0.5 = half resolution, 1.0 = full) |
+| `--workers` | `cpu_count-1` | Number of parallel worker processes |
+| `--scene-change` | off | Skip OCR on near-duplicate frames (mean diff < 2.0); ideal for terminal recordings |
+| `--mps` | off | Use Apple Silicon MPS backend for PyTorch (falls back to CPU if unavailable) |
+| `--resume` | off | Resume from `detections_checkpoint.json` if a previous run was interrupted |
 
 ### Step 3 - Generate the After Effects script
 

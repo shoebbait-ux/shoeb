@@ -5,11 +5,16 @@ detect_and_export.py - Detect sensitive text in video frames and export detectio
 Extracts frames from an MP4, runs EasyOCR on every Nth frame, matches against
 a list of sensitive strings (plus IPv4 regex), groups detections into tracks,
 and writes a detections.json file.
+
+Mac-optimized: multiprocessing frame batching, lazy sequential frame reads,
+frame downscaling for OCR, incremental checkpoint saving, Apple Silicon MPS
+support, and scene-change skipping.
 """
 
 import argparse
 import json
 import math
+import os
 import re
 import sys
 from pathlib import Path
@@ -31,8 +36,10 @@ MIN_CONFIDENCE = 0.4
 PADDING_PX = 10
 IOU_THRESHOLD = 0.30
 MAX_FRAME_GAP = 10
-KEYFRAME_MIN_MOVE = 3  # pixels - store keyframe only if position changed this much
+KEYFRAME_MIN_MOVE = 3   # pixels - store keyframe only if position changed this much
 TRACK_PADDING_FRAMES = 2  # frames added before frame_start and after frame_end
+CHECKPOINT_INTERVAL = 500  # save checkpoint every N processed frames
+MEMORY_CAP = 50  # max frames held in memory at once
 
 
 # ---------------------------------------------------------------------------
@@ -75,17 +82,22 @@ def matches_sensitive(detected_word: str, sensitive_list: list[str]) -> str | No
     return None
 
 
-def easyocr_bbox_to_xywh(bbox: list, frame_w: int, frame_h: int) -> tuple[int, int, int, int]:
+def easyocr_bbox_to_xywh(
+    bbox: list, frame_w: int, frame_h: int, scale: float = 1.0
+) -> tuple[int, int, int, int]:
     """
     Convert EasyOCR bbox ([[x1,y1],[x2,y1],[x2,y2],[x1,y2]]) to (x, y, w, h)
     with 10px padding clamped to frame bounds.
+
+    If scale != 1.0, coordinates are multiplied back up to the original resolution
+    (use when OCR was run on a downscaled frame).
     """
     xs = [pt[0] for pt in bbox]
     ys = [pt[1] for pt in bbox]
-    x1 = int(min(xs))
-    y1 = int(min(ys))
-    x2 = int(max(xs))
-    y2 = int(max(ys))
+    x1 = int(min(xs) / scale)
+    y1 = int(min(ys) / scale)
+    x2 = int(max(xs) / scale)
+    y2 = int(max(ys) / scale)
 
     x = max(0, x1 - PADDING_PX)
     y = max(0, y1 - PADDING_PX)
@@ -199,7 +211,128 @@ def find_or_create_track(
 
 
 # ---------------------------------------------------------------------------
-# Main pipeline
+# Worker function (runs in a subprocess - must be top-level for spawn)
+# ---------------------------------------------------------------------------
+
+def _worker_process_batch(args_tuple: tuple) -> list[dict]:
+    """
+    Process a batch of (frame_idx, frame_rgb) tuples with EasyOCR.
+
+    This function is called in a worker process. Each worker creates its own
+    EasyOCR Reader - readers cannot be shared across processes.
+
+    Returns a list of detection dicts:
+      {"frame_idx": int, "bbox": list, "text": str, "conf": float}
+    """
+    batch, sensitive_list, ocr_scale, use_gpu = args_tuple
+
+    import easyocr  # must import inside worker for spawn safety
+
+    reader = easyocr.Reader(["en"], gpu=use_gpu, verbose=False)
+
+    detections = []
+    for frame_idx, frame_rgb in batch:
+        if ocr_scale != 1.0:
+            h, w = frame_rgb.shape[:2]
+            new_w = int(w * ocr_scale)
+            new_h = int(h * ocr_scale)
+            ocr_frame = cv2.resize(frame_rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        else:
+            ocr_frame = frame_rgb
+
+        results = reader.readtext(ocr_frame, detail=1)
+
+        for bbox, text, conf in results:
+            if conf < MIN_CONFIDENCE:
+                continue
+            matched = matches_sensitive(text, sensitive_list)
+            if matched is None:
+                continue
+            detections.append({
+                "frame_idx": frame_idx,
+                "bbox": bbox,
+                "text": text,
+                "conf": float(conf),
+                "matched": matched,
+            })
+
+    return detections
+
+
+# ---------------------------------------------------------------------------
+# Lazy frame generator - sequential reads (faster than seeking on Mac/APFS)
+# ---------------------------------------------------------------------------
+
+def frame_generator(video_path: str, skip_frames: int, start_frame: int = 0):
+    """
+    Yield (frame_idx, frame_rgb) for every skip_frames-th frame starting
+    at start_frame.
+
+    Uses sequential cap.read() to avoid slow random seeks on Mac/APFS.
+    Discards frames that are not in our sample set by reading-and-ignoring.
+    Never holds more than MEMORY_CAP frames decoded at once - yields one at
+    a time so the caller controls buffering.
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"ERROR: Cannot open video: {video_path}", file=sys.stderr)
+        sys.exit(1)
+
+    current = 0
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            if current < start_frame:
+                current += 1
+                continue
+
+            if (current - start_frame) % skip_frames == 0:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                yield current, frame_rgb
+
+            current += 1
+    finally:
+        cap.release()
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers
+# ---------------------------------------------------------------------------
+
+CHECKPOINT_FILE = "detections_checkpoint.json"
+
+
+def load_checkpoint() -> dict | None:
+    p = Path(CHECKPOINT_FILE)
+    if not p.exists():
+        return None
+    with open(p, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def save_checkpoint(
+    partial_detections: list[dict],
+    last_frame: int,
+    fps: float,
+    width: int,
+    height: int,
+) -> None:
+    data = {
+        "last_frame": last_frame,
+        "fps": fps,
+        "width": width,
+        "height": height,
+        "detections": partial_detections,
+    }
+    with open(CHECKPOINT_FILE, "w", encoding="utf-8") as fh:
+        json.dump(data, fh)
+
+
+# ---------------------------------------------------------------------------
+# Video metadata
 # ---------------------------------------------------------------------------
 
 def get_video_info(video_path: str) -> tuple[float, int, int, int]:
@@ -216,68 +349,168 @@ def get_video_info(video_path: str) -> tuple[float, int, int, int]:
     return fps, total, w, h
 
 
+# ---------------------------------------------------------------------------
+# Main detection pipeline
+# ---------------------------------------------------------------------------
+
 def run_detection(
     video_path: str,
     sensitive_list: list[str],
     skip_frames: int,
     use_gpu: bool,
+    ocr_scale: float,
+    num_workers: int,
+    resume: bool,
+    use_scene_change: bool,
 ) -> tuple[list[Track], float, int, int]:
     """Run OCR over the video and return completed tracks plus video metadata."""
-    import easyocr  # imported here so --help works without easyocr installed
-
-    reader = easyocr.Reader(["en"], gpu=use_gpu, verbose=False)
+    import multiprocessing
+    import psutil
 
     fps, total_frames, width, height = get_video_info(video_path)
     print(f"Video: {width}x{height} @ {fps:.2f} fps, {total_frames} frames total")
-    print(f"Processing every {skip_frames} frame(s) with EasyOCR (GPU={use_gpu})")
+    print(
+        f"Processing every {skip_frames} frame(s) | workers={num_workers} | "
+        f"ocr_scale={ocr_scale} | scene_change={use_scene_change}"
+    )
 
-    cap = cv2.VideoCapture(video_path)
+    # --- Resume support ---
+    start_frame = 0
+    raw_detections: list[dict] = []
+    if resume:
+        checkpoint = load_checkpoint()
+        if checkpoint:
+            start_frame = checkpoint["last_frame"] + 1
+            raw_detections = checkpoint.get("detections", [])
+            print(f"Resuming from frame {start_frame} ({len(raw_detections)} detections loaded)")
+        else:
+            print("No checkpoint found, starting from the beginning.")
+
+    frames_to_process = list(range(start_frame, total_frames, skip_frames))
+    total_to_process = len(frames_to_process)
+    print(f"Frames to process: {total_to_process}")
+
+    # --- Collect frames into batches respecting memory cap ---
+    # Each batch is a list of (frame_idx, frame_rgb) with max size MEMORY_CAP
+    batch_size = max(1, MEMORY_CAP // max(1, num_workers))
+
+    proc = psutil.Process()
+    frames_processed_since_checkpoint = 0
+    last_frame_saved = start_frame - 1
+    scene_skipped = 0
+    prev_gray: np.ndarray | None = None
+
     active_tracks: list[Track] = []
     completed_tracks: list[Track] = []
 
-    frames_to_process = range(0, total_frames, skip_frames)
+    with tqdm(total=total_to_process, unit="frame", desc="Detecting") as pbar:
+        gen = frame_generator(video_path, skip_frames, start_frame)
 
-    with tqdm(total=len(frames_to_process), unit="frame", desc="Detecting") as pbar:
-        for frame_idx in frames_to_process:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, frame = cap.read()
-            if not ret:
-                pbar.update(1)
-                continue
+        current_batch: list[tuple[int, np.ndarray]] = []
+        batches_queued = 0
 
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = reader.readtext(frame_rgb, detail=1)
+        def flush_batch(batch: list) -> None:
+            nonlocal raw_detections, frames_processed_since_checkpoint, last_frame_saved
 
-            seen_strings_this_frame: set[str] = set()
+            if not batch:
+                return
 
-            for bbox, text, conf in results:
-                if conf < MIN_CONFIDENCE:
-                    continue
-                matched = matches_sensitive(text, sensitive_list)
-                if matched is None:
-                    continue
-                box = easyocr_bbox_to_xywh(bbox, width, height)
-                find_or_create_track(active_tracks, matched, frame_idx, box)
-                seen_strings_this_frame.add(matched + str(box))
+            if num_workers <= 1:
+                # Single-process path: avoid Pool overhead
+                result = _worker_process_batch(
+                    (batch, sensitive_list, ocr_scale, use_gpu)
+                )
+                raw_detections.extend(result)
+            else:
+                with multiprocessing.Pool(processes=num_workers) as pool:
+                    # Split batch evenly across workers
+                    sub_size = max(1, math.ceil(len(batch) / num_workers))
+                    sub_batches = [
+                        (batch[i:i + sub_size], sensitive_list, ocr_scale, use_gpu)
+                        for i in range(0, len(batch), sub_size)
+                    ]
+                    for sub_result in pool.imap_unordered(
+                        _worker_process_batch, sub_batches, chunksize=1
+                    ):
+                        raw_detections.extend(sub_result)
 
-            # Expire tracks that haven't been seen for too long
-            still_active: list[Track] = []
-            for t in active_tracks:
-                if frame_idx - t.last_frame > MAX_FRAME_GAP + skip_frames:
-                    completed_tracks.append(t)
-                else:
-                    still_active.append(t)
-            active_tracks = still_active
+            frames_processed_since_checkpoint += len(batch)
+            last_frame_saved = batch[-1][0]
+
+            # Incremental checkpoint
+            if frames_processed_since_checkpoint >= CHECKPOINT_INTERVAL:
+                save_checkpoint(raw_detections, last_frame_saved, fps, width, height)
+                frames_processed_since_checkpoint = 0
+
+        for frame_idx, frame_rgb in gen:
+            # Scene-change detection: skip near-duplicate frames
+            if use_scene_change:
+                gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+                if prev_gray is not None:
+                    diff = cv2.absdiff(gray, prev_gray)
+                    if diff.mean() < 2.0:
+                        scene_skipped += 1
+                        pbar.update(1)
+                        # Do NOT update prev_gray - compare against last non-skipped frame
+                        continue
+                prev_gray = gray
+
+            current_batch.append((frame_idx, frame_rgb))
+
+            if len(current_batch) >= batch_size:
+                flush_batch(current_batch)
+                current_batch = []
+                batches_queued += 1
 
             pbar.update(1)
 
-    cap.release()
+            # Update progress postfix every 10 frames
+            if (pbar.n % 10) == 0:
+                mem_mb = proc.memory_info().rss / 1024 ** 2
+                pbar.set_postfix({
+                    "mem_MB": f"{mem_mb:.0f}",
+                    "tracks": len(active_tracks) + len(completed_tracks),
+                    "skipped": scene_skipped,
+                })
+
+        # Flush remaining frames
+        flush_batch(current_batch)
+
+    if use_scene_change:
+        print(f"Scene-change: skipped {scene_skipped} near-duplicate frames")
+
+    # --- Sort all raw detections by frame index then build tracks ---
+    raw_detections.sort(key=lambda d: d["frame_idx"])
+
+    for det in raw_detections:
+        frame_idx = det["frame_idx"]
+        bbox = det["bbox"]
+        matched = det["matched"]
+        box = easyocr_bbox_to_xywh(bbox, width, height, scale=ocr_scale)
+        find_or_create_track(active_tracks, matched, frame_idx, box)
+
+        # Expire stale tracks
+        still_active = []
+        for t in active_tracks:
+            if frame_idx - t.last_frame > MAX_FRAME_GAP + skip_frames:
+                completed_tracks.append(t)
+            else:
+                still_active.append(t)
+        active_tracks = still_active
 
     # Move remaining active tracks to completed
     completed_tracks.extend(active_tracks)
 
+    # Clean up checkpoint after a successful full run
+    if Path(CHECKPOINT_FILE).exists():
+        Path(CHECKPOINT_FILE).unlink()
+
     return completed_tracks, fps, width, height
 
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -298,7 +531,41 @@ def main() -> None:
         "--gpu",
         action="store_true",
         default=False,
-        help="Enable EasyOCR GPU mode",
+        help="Enable EasyOCR GPU mode (CUDA only)",
+    )
+    parser.add_argument(
+        "--ocr-scale",
+        type=float,
+        default=0.5,
+        dest="ocr_scale",
+        help="Downscale factor for OCR input (default: 0.5 = half resolution). "
+             "Lower = faster; 1.0 = full resolution.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help="Resume from detections_checkpoint.json if present",
+    )
+    parser.add_argument(
+        "--mps",
+        action="store_true",
+        default=False,
+        help="Try to use Apple Silicon MPS backend for PyTorch (falls back to CPU)",
+    )
+    parser.add_argument(
+        "--scene-change",
+        action="store_true",
+        default=False,
+        dest="scene_change",
+        help="Skip OCR on frames with mean pixel diff < 2.0 vs previous frame "
+             "(ideal for static terminal recordings)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=max(1, (os.cpu_count() or 2) - 1),
+        help="Number of worker processes (default: cpu_count - 1)",
     )
     args = parser.parse_args()
 
@@ -309,6 +576,21 @@ def main() -> None:
     if not Path(args.strings).exists():
         print(f"ERROR: Strings file not found: {args.strings}", file=sys.stderr)
         sys.exit(1)
+    if not (0.1 <= args.ocr_scale <= 1.0):
+        print("ERROR: --ocr-scale must be between 0.1 and 1.0", file=sys.stderr)
+        sys.exit(1)
+
+    # --- Apple Silicon MPS setup ---
+    if args.mps:
+        try:
+            import torch
+            if torch.backends.mps.is_available():
+                torch.set_default_device("mps")
+                print("MPS backend enabled (Apple Silicon).")
+            else:
+                print("WARNING: MPS requested but not available. Falling back to CPU.")
+        except ImportError:
+            print("WARNING: torch not installed; --mps has no effect.")
 
     sensitive_list = load_sensitive_strings(args.strings)
     print(f"Loaded {len(sensitive_list)} sensitive string(s) (+ IPv4 pattern)")
@@ -317,7 +599,14 @@ def main() -> None:
     Track._next_id = 1
 
     tracks, fps, width, height = run_detection(
-        args.input, sensitive_list, args.skip_frames, args.gpu
+        video_path=args.input,
+        sensitive_list=sensitive_list,
+        skip_frames=args.skip_frames,
+        use_gpu=args.gpu,
+        ocr_scale=args.ocr_scale,
+        num_workers=args.workers,
+        resume=args.resume,
+        use_scene_change=args.scene_change,
     )
 
     # Build output structure
@@ -342,4 +631,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.set_start_method("spawn", force=True)
     main()
