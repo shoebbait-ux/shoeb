@@ -3,7 +3,7 @@
 generate_ae_script.py - Generate an After Effects ExtendScript JSX from detections.json.
 
 Reads the detections JSON produced by detect_and_export.py and emits a .jsx file
-that, when run inside After Effects, creates Fast Box Blur solid layers for each
+that, when run inside After Effects, creates Gaussian Blur solid layers for each
 track and groups them into a pre-comp named AUTO_REDACTIONS.
 
 Optimized: all track data is emitted as a single JS array and processed in a
@@ -149,9 +149,9 @@ def generate_jsx(detections: dict) -> str:
         "            }\n"
         "        }\n"
         "\n"
-        "        // Apply Fast Box Blur effect\n"
-        "        var blur = solid.Effects.addProperty(\"ADBE Box Blur2\");\n"
-        "        blur.property(\"Blur Radius\").setValue(25);\n"
+        "        // Apply Gaussian Blur effect\n"
+        "        var blur = solid.Effects.addProperty(\"ADBE Gaussian Blur 2\");\n"
+        "        blur.property(\"Blurriness\").setValue(40);\n"
         "        blur.property(\"Repeat Edge Pixels\").setValue(true);\n"
         "\n"
         "        // Record the layer index directly (no full-layer-list scan needed later)\n"
