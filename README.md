@@ -19,7 +19,7 @@ python detect_and_export.py \
   --input recording.mp4 \
   --strings sensitive_strings.txt \
   --skip-frames 3 \
-  --ocr-scale 0.5 \
+  --ocr-scale 0.75 \
   --scene-change \
   --workers 4
 ```
@@ -30,7 +30,7 @@ python detect_and_export.py \
   --input recording.mp4 \
   --strings sensitive_strings.txt \
   --skip-frames 3 \
-  --ocr-scale 0.5 \
+  --ocr-scale 0.75 \
   --mps \
   --workers 4
 ```
@@ -138,6 +138,7 @@ Terminal recordings often have white text on dark backgrounds with high contrast
 - If the recording has low resolution or small fonts, try `--skip-frames 1` to catch every frame.
 - If you get false positives (non-sensitive text being blurred), raise the confidence threshold by editing `MIN_CONFIDENCE` in `detect_and_export.py` from `0.4` to `0.5` or `0.6`.
 - For very long recordings (1+ hour), `--skip-frames 4` or `--skip-frames 6` speeds things up significantly with minimal quality loss.
+- For MobaXterm recordings with small terminal fonts, use `--ocr-scale 0.75` or `--ocr-scale 1.0` for best detection accuracy. Only use `0.5` if speed is more important than catching every occurrence.
 
 ---
 
