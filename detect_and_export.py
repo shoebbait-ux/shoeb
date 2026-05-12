@@ -92,8 +92,8 @@ def easyocr_bbox_to_xywh(
     If scale != 1.0, coordinates are multiplied back up to the original resolution
     (use when OCR was run on a downscaled frame).
     """
-    xs = [pt[0] for pt in bbox]
-    ys = [pt[1] for pt in bbox]
+    xs = [float(pt[0]) for pt in bbox]
+    ys = [float(pt[1]) for pt in bbox]
     x1 = int(min(xs) / scale)
     y1 = int(min(ys) / scale)
     x2 = int(max(xs) / scale)
